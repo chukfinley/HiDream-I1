@@ -1,212 +1,194 @@
-#!/usr/bin/env python3
-"""
-Batch inference script for HiDream-I1 that processes prompts from a text file.
-Usage: python batch_inference.py --prompts_file prompts.txt --model_type full
-"""
-
-import argparse
-import os
-import time
-from pathlib import Path
 import torch
+from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
+from diffusers import HiDreamImagePipeline
+import os
 from datetime import datetime
 import json
+from tqdm import tqdm
 
-# Import the original inference components
-from inference import load_model, generate_image
-
-
-def load_prompts_from_file(file_path):
-    """Load prompts from a text file, one prompt per line."""
-    prompts = []
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if line and not line.startswith('#'):  # Skip empty lines and comments
-                    prompts.append({
-                        'prompt': line,
-                        'line_number': line_num
-                    })
-        print(f"Loaded {len(prompts)} prompts from {file_path}")
-        return prompts
-    except FileNotFoundError:
-        print(f"Error: File {file_path} not found!")
-        return []
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-        return []
-
-
-def sanitize_filename(prompt, max_length=100):
-    """Convert prompt to a safe filename."""
-    # Remove or replace invalid characters
-    invalid_chars = '<>:"/\\|?*'
-    for char in invalid_chars:
-        prompt = prompt.replace(char, '_')
-    
-    # Truncate if too long
-    if len(prompt) > max_length:
-        prompt = prompt[:max_length] + "..."
-    
-    return prompt
-
-
-def batch_generate_images(prompts, model_components, args):
-    """Generate images for all prompts in batch."""
-    
-    # Create output directory with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"outputs/batch_{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create results log
-    results = []
-    log_file = output_dir / "generation_log.json"
-    
-    print(f"Starting batch generation of {len(prompts)} images...")
-    print(f"Output directory: {output_dir}")
-    
-    for i, prompt_data in enumerate(prompts, 1):
-        prompt = prompt_data['prompt']
-        line_num = prompt_data['line_number']
+class HiDreamBatchInference:
+    def __init__(self, model_name="HiDream-ai/HiDream-I1-Full", device="cuda"):
+        """
+        Initialize the HiDream batch inference pipeline
         
-        print(f"\n[{i}/{len(prompts)}] Processing line {line_num}: {prompt[:80]}...")
+        Args:
+            model_name: HiDream model variant ("HiDream-ai/HiDream-I1-Full", "HiDream-ai/HiDream-I1-Dev", "HiDream-ai/HiDream-I1-Fast")
+            device: Device to run inference on
+        """
+        print("Loading tokenizer and text encoder...")
+        self.tokenizer_4 = PreTrainedTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct")
+        self.text_encoder_4 = LlamaForCausalLM.from_pretrained(
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            output_hidden_states=True,
+            output_attentions=True,
+            torch_dtype=torch.bfloat16,
+        )
         
-        try:
-            start_time = time.time()
-            
-            # Generate image
-            image = generate_image(
-                prompt=prompt,
-                model_components=model_components,
-                height=args.height,
-                width=args.width,
-                guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps,
-                seed=args.seed if args.seed >= 0 else None
-            )
-            
-            generation_time = time.time() - start_time
-            
-            # Create filename
-            safe_prompt = sanitize_filename(prompt)
-            filename = f"{i:04d}_{safe_prompt}.png"
-            image_path = output_dir / filename
-            
-            # Save image
-            image.save(image_path)
-            
-            # Log result
-            result = {
-                "index": i,
-                "line_number": line_num,
-                "prompt": prompt,
-                "filename": filename,
-                "generation_time": round(generation_time, 2),
-                "success": True,
-                "error": None
-            }
-            results.append(result)
-            
-            print(f"✓ Generated in {generation_time:.2f}s -> {filename}")
-            
-        except Exception as e:
-            print(f"✗ Error generating image: {e}")
-            result = {
-                "index": i,
-                "line_number": line_num,
-                "prompt": prompt,
-                "filename": None,
-                "generation_time": None,
-                "success": False,
-                "error": str(e)
-            }
-            results.append(result)
+        print(f"Loading HiDream pipeline: {model_name}")
+        self.pipe = HiDreamImagePipeline.from_pretrained(
+            model_name,
+            tokenizer_4=self.tokenizer_4,
+            text_encoder_4=self.text_encoder_4,
+            torch_dtype=torch.bfloat16,
+        )
         
-        # Save log after each generation
-        with open(log_file, 'w') as f:
-            json.dump(results, f, indent=2)
+        self.pipe = self.pipe.to(device)
+        self.device = device
+        self.model_name = model_name
+        
+        # Set default parameters based on model variant
+        if "Dev" in model_name or "Fast" in model_name:
+            self.default_guidance_scale = 0.0
+            self.default_steps = 16 if "Fast" in model_name else 28
+        else:
+            self.default_guidance_scale = 5.0
+            self.default_steps = 50
+            
+        print(f"Pipeline loaded successfully! Default settings: guidance_scale={self.default_guidance_scale}, steps={self.default_steps}")
     
-    # Final summary
-    successful = sum(1 for r in results if r['success'])
-    failed = len(results) - successful
-    total_time = sum(r['generation_time'] for r in results if r['generation_time'])
+    def generate_single(self, prompt, **kwargs):
+        """Generate a single image from a prompt"""
+        # Use default parameters if not specified
+        height = kwargs.get('height', 1024)
+        width = kwargs.get('width', 1024)
+        guidance_scale = kwargs.get('guidance_scale', self.default_guidance_scale)
+        num_inference_steps = kwargs.get('num_inference_steps', self.default_steps)
+        seed = kwargs.get('seed', None)
+        
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(self.device).manual_seed(seed)
+        
+        image = self.pipe(
+            prompt,
+            height=height,
+            width=width,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+        ).images[0]
+        
+        return image
     
-    print(f"\n{'='*60}")
-    print(f"BATCH GENERATION COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total prompts: {len(prompts)}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Total generation time: {total_time:.2f}s")
-    print(f"Average time per image: {total_time/successful:.2f}s" if successful > 0 else "N/A")
-    print(f"Output directory: {output_dir}")
-    print(f"Log file: {log_file}")
-    
-    return results
-
+    def batch_generate(self, prompts, output_dir="batch_output", **kwargs):
+        """
+        Generate images for a batch of prompts
+        
+        Args:
+            prompts: List of prompt strings or list of dicts with prompt and parameters
+            output_dir: Directory to save generated images
+            **kwargs: Default parameters for all prompts (can be overridden per prompt)
+        """
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create metadata file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        metadata_file = os.path.join(output_dir, f"batch_metadata_{timestamp}.json")
+        metadata = {
+            "model": self.model_name,
+            "timestamp": timestamp,
+            "default_params": kwargs,
+            "results": []
+        }
+        
+        print(f"Starting batch generation of {len(prompts)} images...")
+        print(f"Output directory: {output_dir}")
+        
+        for i, prompt_data in enumerate(tqdm(prompts, desc="Generating images")):
+            try:
+                # Handle both string prompts and dict prompts
+                if isinstance(prompt_data, str):
+                    prompt = prompt_data
+                    params = kwargs.copy()
+                else:
+                    prompt = prompt_data.get('prompt', '')
+                    params = kwargs.copy()
+                    params.update(prompt_data.get('params', {}))
+                
+                # Generate image
+                image = self.generate_single(prompt, **params)
+                
+                # Save image
+                filename = f"image_{i:04d}_{timestamp}.png"
+                filepath = os.path.join(output_dir, filename)
+                image.save(filepath)
+                
+                # Add to metadata
+                result_metadata = {
+                    "index": i,
+                    "prompt": prompt,
+                    "filename": filename,
+                    "parameters": params
+                }
+                metadata["results"].append(result_metadata)
+                
+                print(f"✓ Generated image {i+1}/{len(prompts)}: {filename}")
+                
+            except Exception as e:
+                print(f"✗ Error generating image {i+1}: {str(e)}")
+                metadata["results"].append({
+                    "index": i,
+                    "prompt": prompt if 'prompt' in locals() else "Unknown",
+                    "error": str(e)
+                })
+        
+        # Save metadata
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"\nBatch generation complete!")
+        print(f"Metadata saved to: {metadata_file}")
+        
+        return metadata
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch image generation with HiDream-I1")
-    parser.add_argument("--prompts_file", type=str, required=True,
-                        help="Path to text file containing prompts (one per line)")
-    parser.add_argument("--model_type", type=str, default="full", 
-                        choices=["full", "dev", "fast"],
-                        help="Model variant to use")
-    parser.add_argument("--height", type=int, default=1024,
-                        help="Image height")
-    parser.add_argument("--width", type=int, default=1024,
-                        help="Image width")
-    parser.add_argument("--guidance_scale", type=float, default=5.0,
-                        help="Guidance scale (use 0.0 for dev/fast models)")
-    parser.add_argument("--num_inference_steps", type=int, default=None,
-                        help="Number of inference steps (auto-set based on model_type if not specified)")
-    parser.add_argument("--seed", type=int, default=-1,
-                        help="Random seed (-1 for random)")
+    """Example usage of the batch inference system"""
     
-    args = parser.parse_args()
+    # Initialize the batch inference system
+    batch_system = HiDreamBatchInference(
+        model_name="HiDream-ai/HiDream-I1-Full"  # Change to Dev or Fast if needed
+    )
     
-    # Auto-set inference steps based on model type
-    if args.num_inference_steps is None:
-        if args.model_type == "full":
-            args.num_inference_steps = 50
-        elif args.model_type == "dev":
-            args.num_inference_steps = 28
-        elif args.model_type == "fast":
-            args.num_inference_steps = 16
+    # Example 1: Simple list of prompts
+    simple_prompts = [
+        'A cat holding a sign that says "HiDream.ai"',
+        'A futuristic cityscape at sunset with flying cars',
+        'A magical forest with glowing mushrooms and fairy lights',
+        'A steampunk robot playing chess in a Victorian library',
+        'An astronaut riding a horse on Mars with Earth in the background'
+    ]
     
-    # Auto-adjust guidance scale for dev/fast models
-    if args.model_type in ["dev", "fast"] and args.guidance_scale == 5.0:
-        args.guidance_scale = 0.0
-        print(f"Auto-adjusted guidance_scale to 0.0 for {args.model_type} model")
+    # Example 2: Advanced prompts with individual parameters
+    advanced_prompts = [
+        {
+            'prompt': 'A hyperrealistic portrait of a cyberpunk hacker in neon-lit Tokyo',
+            'params': {'seed': 42, 'guidance_scale': 7.0}
+        },
+        {
+            'prompt': 'A serene Japanese garden with cherry blossoms and a traditional bridge',
+            'params': {'seed': 123, 'num_inference_steps': 75}
+        },
+        {
+            'prompt': 'A dramatic black and white photograph of a lighthouse in a storm',
+            'params': {'seed': 456, 'width': 768, 'height': 1024}
+        }
+    ]
     
-    print(f"Configuration:")
-    print(f"  Model type: {args.model_type}")
-    print(f"  Prompts file: {args.prompts_file}")
-    print(f"  Image size: {args.width}x{args.height}")
-    print(f"  Guidance scale: {args.guidance_scale}")
-    print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Seed: {args.seed}")
+    # Run batch generation with simple prompts
+    print("=== Running Simple Batch Generation ===")
+    batch_system.batch_generate(
+        prompts=simple_prompts,
+        output_dir="simple_batch_output",
+        seed=0  # Default seed for all images
+    )
     
-    # Load prompts
-    prompts = load_prompts_from_file(args.prompts_file)
-    if not prompts:
-        print("No valid prompts found. Exiting.")
-        return
-    
-    # Load model
-    print(f"\nLoading {args.model_type} model...")
-    try:
-        model_components = load_model(args.model_type)
-        print("✓ Model loaded successfully")
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        return
-    
-    # Generate images
-    batch_generate_images(prompts, model_components, args)
-
+    # Run batch generation with advanced prompts
+    print("\n=== Running Advanced Batch Generation ===")
+    batch_system.batch_generate(
+        prompts=advanced_prompts,
+        output_dir="advanced_batch_output"
+    )
 
 if __name__ == "__main__":
     main()
